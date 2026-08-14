@@ -19,6 +19,8 @@ jobs:
     
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -30,13 +32,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
+      - name: Verify TCX files exist
+        run: |
+          echo "Checking for TCX files..."
+          find tcx -name "*.tcx" -type f | head -10
+          echo "Total TCX files: $(find tcx -name "*.tcx" -type f | wc -l)"
+      
       - name: Generate map
         run: python sailingheatmap.py
+      
+      - name: Verify output file was created
+        run: |
+          ls -lh sailing_tracks_speed_arrows.html || echo "Output file not found!"
       
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: .
-          include_dotfiles: false
-          cname: false
+
