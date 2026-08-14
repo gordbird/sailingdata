@@ -428,7 +428,7 @@ window.addEventListener('load', function() {{
     let pointIndex = 0;
     let timer = null;
     let paused = false;
-    let selectedYear = allYears.length > 0 ? allYears[0] : null;
+    let selectedYear = allYears.includes('2026') ? '2026' : (allYears.length > 0 ? allYears[0] : null);
     let selectedRouteName = null;
     let currentRuns = [];
 
@@ -661,13 +661,17 @@ window.addEventListener('load', function() {{
     // Replaces the old "scan map._layers for matching option metadata" approach:
     // we already hold direct references to each year/route's layer group from drawRoutes().
     function updateLayerOpacity() {{
+        const baseOpacity = 0.18;
+        const accentOpacity = 1.0;
+
         allYears.forEach(year => {{
             const activeYear = year === selectedYear;
             const routes = routeLayerGroups[year] || {{}};
             Object.keys(routes).forEach(routeName => {{
                 const isSelectedRoute = activeYear && selectedRouteName && routeName === selectedRouteName;
-                const isVisible = !selectedRouteName || !activeYear || isSelectedRoute;
-                const opacity = isVisible ? (activeYear ? 1.0 : 0.10) : 0.0;
+                const isAllSelectedYear = activeYear && !selectedRouteName;
+                const opacity = isSelectedRoute || isAllSelectedYear ? accentOpacity : baseOpacity;
+
                 routes[routeName].eachLayer(layer => {{
                     if (layer.setStyle) {{
                         layer.setStyle({{ opacity, fillOpacity: opacity }});
