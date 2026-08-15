@@ -5,6 +5,7 @@ import folium
 from datetime import datetime
 from math import asin, atan2, ceil, cos, radians, sin, sqrt
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from branca.element import MacroElement
 from jinja2 import Template
@@ -221,7 +222,16 @@ def _round_point(point):
     return [round(lat, COORD_PRECISION), round(lon, COORD_PRECISION), round(speed, SPEED_PRECISION)]
 
 
-runs = []  # List of (year, points, route_name, removed_points) tuples
+def format_edt_timestamp(iso_string):
+    """Convert an ISO8601 UTC timestamp to Eastern Daylight Time for display."""
+    try:
+        dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
+        return dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S EDT")
+    except Exception:
+        return iso_string
+
+
+runs = []  # List of (year, points, display_name, activity_name, removed_points) tuples
 all_points = []  # (lat, lon, speed_in_knots) - used only for map bounds
 all_years = set()
 observed_max_speed = 0.0
@@ -238,8 +248,18 @@ if TCX_BASE_DIR.exists():
                 points, removed_count, max_speed = parse_tcx_file(file)
                 observed_max_speed = max(observed_max_speed, max_speed)
                 if points:
-                    route_name = file.stem
-                    runs.append((year, points, route_name, removed_count))
+                    activity_name = file.stem
+                    activity_timestamp = file.stem if not file.stem.startswith("activity_") else file.stem
+                    try:
+                        tree = ET.parse(file)
+                        ns = {"ns": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"}
+                        activity_id = tree.findtext(".//ns:Activity/ns:Id", namespaces=ns) or tree.findtext(".//ns:Lap/@StartTime", namespaces=ns)
+                        if activity_id:
+                            activity_timestamp = activity_id
+                    except Exception:
+                        pass
+                    route_label = format_edt_timestamp(activity_timestamp)
+                    runs.append((year, points, route_label, activity_name, removed_count))
                     all_points.extend(points)
         except ValueError:
             # Skip non-numeric directory names
@@ -321,11 +341,13 @@ if runs:
     # of point data in the file (previously it was duplicated: once inside the
     # per-segment Folium objects, and again here for the animation).
     route_data_by_year = {}
-    for year, run, route_name, removed_count in runs:
+    for year, run, route_label, activity_name, removed_count in runs:
         if year not in route_data_by_year:
             route_data_by_year[year] = []
         route_data_by_year[year].append({
-            "name": route_name,
+            "name": route_label,
+            "activityName": activity_name,
+            "activityTimestamp": route_label,
             "points": [_round_point(p) for p in run],
             "removedPoints": removed_count,
         })
@@ -383,6 +405,71 @@ window.addEventListener('load', function() {{
         return R * c;
     }}
 
+    function formatEDT(isoValue) {{
+        const date = new Date(isoValue);
+        if (Number.isNaN(date.getTime())) {{
+            return isoValue;
+        }}
+        const parts = new Intl.DateTimeFormat('en-US', {{
+            timeZone: 'America/New_York',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+            timeZoneName: 'short'
+        }}).formatToParts(date);
+        const map = {{}};
+        parts.forEach(part => {{
+            if (part.type !== 'literal') {{
+                map[part.type] = part.value;
+            }}
+        }});
+        const tz = map.timeZoneName || 'EDT';
+        return map.year + '-' + map.month + '-' + map.day + ' ' + map.hour + ':' + map.minute + ':' + map.second + ' ' + tz;
+    }}
+
+    function solarDirection(lat, lon, isoValue) {{
+        const date = new Date(isoValue);
+        if (Number.isNaN(date.getTime())) {{
+            return {{label: 'Sun: unavailable', azimuth: 0, altitude: 0}};
+        }}
+
+        const rad = Math.PI / 180;
+        const latRad = lat * rad;
+        const lonRad = lon * rad;
+
+        const localDate = new Date(date.toLocaleString('en-US', {{ timeZone: 'America/New_York' }}));
+        const localHours = localDate.getHours() + localDate.getMinutes() / 60 + localDate.getSeconds() / 3600;
+        const dayOfYear = Math.floor((Date.UTC(localDate.getFullYear(), localDate.getMonth(), localDate.getDate()) - Date.UTC(localDate.getFullYear(), 0, 0)) / 86400000);
+        const B = 2 * Math.PI * (dayOfYear - 81) / 365;
+        const declination = 23.44 * Math.sin(B) * rad;
+        const eqTime = 9.87 * Math.sin(2 * B) - 7.53 * Math.cos(B) - 1.5 * Math.sin(B / 2);
+        const solarNoon = 12 + (lon / 15) - eqTime / 60;
+        const hourAngle = (localHours - solarNoon) * 15 * rad;
+        const altitude = Math.asin(
+            Math.sin(latRad) * Math.sin(declination) +
+            Math.cos(latRad) * Math.cos(declination) * Math.cos(hourAngle)
+        ) / rad;
+        const azimuth = Math.atan2(
+            Math.sin(hourAngle),
+            Math.cos(hourAngle) * Math.sin(latRad) - Math.tan(declination) * Math.cos(latRad)
+        );
+        const normAz = (azimuth * 180 / Math.PI + 180 + 360) % 360;
+        const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+        const direction = directions[Math.round(normAz / 45) % 8];
+        const altitudeClamped = Math.max(-90, Math.min(90, altitude));
+        const localTimeText = formatEDT(isoValue);
+        return {{
+            label: direction + ' • ' + Math.round(altitudeClamped) + '° alt • ' + localTimeText,
+            azimuth: normAz,
+            altitude: altitudeClamped,
+            localTimeText
+        }};
+    }}
+
     // ---- Draw all tracks once, onto a single shared canvas renderer ----
     const sharedRenderer = L.canvas({{ padding: 0.5 }});
     const yearLayerGroups = {{}};
@@ -403,7 +490,7 @@ window.addEventListener('load', function() {{
 
                     L.polyline([[lat1, lon1], [lat2, lon2]], {{
                         renderer: sharedRenderer, color, weight: 4, opacity: 1
-                    }}).bindTooltip(route.name + ' • Year ' + year + ': ' + avgSpeed.toFixed(1) + ' kn')
+                    }}).bindTooltip(route.activityName + ' • ' + route.name + ' • Year ' + year + ': ' + avgSpeed.toFixed(1) + ' kn')
                       .addTo(routeGroup);
                 }}
                 routeGroup.addTo(yearGroup);
@@ -517,7 +604,10 @@ window.addEventListener('load', function() {{
     function updateStatusLabel() {{
         const total = currentRuns.length;
         const routeLabel = selectedRouteName ? ' • ' + selectedRouteName : '';
-        const label = 'Year: ' + selectedYear + routeLabel + ' • Animating run ' + (total > 0 ? (runIndex + 1) : 0) + ' / ' + total + ' • point ' + (currentRuns[runIndex] ? (pointIndex + 1) : 0);
+        const currentRun = currentRuns[runIndex] || [];
+        const point = currentRun[pointIndex] || currentRun[0] || [0, 0];
+        const sun = solarDirection(point[0], point[1], currentRun.isoTimestamp || currentRun.activityTimestamp || new Date().toISOString());
+        const label = 'Year: ' + selectedYear + routeLabel + ' • ' + sun.localTimeText + ' • Animating run ' + (total > 0 ? (runIndex + 1) : 0) + ' / ' + total + ' • point ' + (currentRuns[runIndex] ? (pointIndex + 1) : 0) + ' • Sun: ' + sun.label;
         status.textContent = label;
     }}
 
