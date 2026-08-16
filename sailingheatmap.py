@@ -1,8 +1,9 @@
 import json
+import re
 import statistics
 import lxml.etree as ET
 import folium
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from math import asin, atan2, ceil, cos, radians, sin, sqrt
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Directory containing TCX files (organized by year)
 TCX_BASE_DIR = SCRIPT_DIR / "tcx"
+SRT_BASE_DIR = SCRIPT_DIR / "srt"
 
 # Maximum speed for the color gradient (knots). Used as-is when AUTO_MAX_DISPLAY_SPEED
 # is False, or as a fallback if there's no data to measure. When AUTO_MAX_DISPLAY_SPEED
@@ -164,13 +166,91 @@ def simplify_track(points, tolerance_m, speed_tolerance_kn=0.0):
     return [p for p, k in zip(points, keep) if k]
 
 
+LOCAL_TZ = ZoneInfo("America/New_York")
+# DJI SRT captions appear to be stamped ~3 hours early relative to the sailing route clock.
+# Apply the same offset before overlap checks so the drone footage lines up with the selected
+# route windows such as 2026-07-29 15:28 EDT and 2026-07-30 15:27 EDT.
+DRONE_TIME_OFFSET = timedelta(hours=3)
+
+
+def normalize_datetime(dt):
+    """Return a naive UTC datetime for reliable cross-source comparisons."""
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def format_edt_timestamp(iso_string):
+    """Convert an ISO8601 UTC timestamp to Eastern Daylight Time for display."""
+    try:
+        dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
+        return dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S EDT")
+    except Exception:
+        return iso_string
+
+
+def format_activity_name(base_name, route_times, has_drone):
+    """Convert a route to an EDT-local, human-readable label and prefix D for drone overlap."""
+    if not route_times:
+        return base_name
+
+    start_dt = min(route_times)
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    local_start = start_dt.astimezone(LOCAL_TZ)
+    label = local_start.strftime("%Y-%m-%d %H:%M") + " EDT"
+    if has_drone:
+        return f"D {label}"
+    return label
+
+
+def parse_srt_file(file_path):
+    """Parse a DJI SRT caption file into [(timestamp, lat, lon), ...] points."""
+    print(f"Processing drone track {file_path}")
+    try:
+        lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        points = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1
+                continue
+            try:
+                ts = datetime.strptime(line, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=LOCAL_TZ)
+            except ValueError:
+                i += 1
+                continue
+
+            lat = None
+            lon = None
+            for j in range(i + 1, min(i + 8, len(lines))):
+                next_line = lines[j]
+                lat_match = re.search(r"\[latitude:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\]", next_line)
+                lon_match = re.search(r"\[longitude:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\]", next_line)
+                if lat_match and lon_match:
+                    lat = float(lat_match.group(1))
+                    lon = float(lon_match.group(1))
+                    break
+            if lat is not None and lon is not None:
+                adjusted_ts = ts + DRONE_TIME_OFFSET
+                points.append((normalize_datetime(adjusted_ts), lat, lon))
+            i += 1
+
+        return points
+    except Exception as exc:
+        print(f"Error reading {file_path}: {exc}")
+        return []
+
+
 def parse_tcx_file(file_path):
-    """Parse a TCX file into a list of (lat, lon, speed) points."""
+    """Parse a TCX file into a list of (lat, lon, speed) points and route timestamps."""
     print(f"Processing {file_path}")
     try:
         tree = ET.parse(file_path)
         ns = {"ns": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"}
         points = []
+        timestamps = []
         last_time, last_lat, last_lon = None, None, None
 
         for tp in tree.findall(".//ns:Trackpoint", ns):
@@ -180,7 +260,8 @@ def parse_tcx_file(file_path):
 
             if lat and lon and time:
                 lat, lon = float(lat), float(lon)
-                t = datetime.fromisoformat(time.replace("Z", "+00:00"))
+                t = normalize_datetime(datetime.fromisoformat(time.replace("Z", "+00:00")))
+                timestamps.append(t)
 
                 speed = 0.0
                 if last_time is not None:
@@ -199,10 +280,6 @@ def parse_tcx_file(file_path):
             std_speed = statistics.pstdev(valid_speeds) if len(valid_speeds) > 1 else 0.0
             print(f"    cleaned {removed_count} outlier speed points (hard cap 20 kn, suspect >12 kn, sigma cutoff {mean_speed + 3.0 * std_speed:.1f} kn)")
 
-        # Max speed is measured on the cleaned-but-not-yet-simplified points, since
-        # that's the trustworthy ceiling: simplification usually keeps extreme points
-        # (large speed deviations trip the RDP speed check) but there's no need to
-        # rely on that for something as important as the color scale's top end.
         max_speed = max((s for _, _, s in cleaned_points), default=0.0)
 
         simplified_points = simplify_track(cleaned_points, SIMPLIFY_TOLERANCE_M, SIMPLIFY_SPEED_TOLERANCE_KN)
@@ -211,10 +288,10 @@ def parse_tcx_file(file_path):
             print(f"    simplified {len(cleaned_points)} -> {len(simplified_points)} points ({pct:.0f}% reduction, "
                   f"tolerance {SIMPLIFY_TOLERANCE_M}m / {SIMPLIFY_SPEED_TOLERANCE_KN}kn)")
 
-        return simplified_points, removed_count, max_speed
+        return simplified_points, removed_count, max_speed, timestamps
     except Exception as exc:
         print(f"Error reading {file_path}: {exc}")
-        return [], 0, 0.0
+        return [], 0, 0.0, []
 
 
 def _round_point(point):
@@ -222,19 +299,16 @@ def _round_point(point):
     return [round(lat, COORD_PRECISION), round(lon, COORD_PRECISION), round(speed, SPEED_PRECISION)]
 
 
-def format_edt_timestamp(iso_string):
-    """Convert an ISO8601 UTC timestamp to Eastern Daylight Time for display."""
-    try:
-        dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
-        return dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S EDT")
-    except Exception:
-        return iso_string
-
-
-runs = []  # List of (year, points, display_name, activity_name, removed_points) tuples
+runs = []  # List of (year, points, route_name, removed_points, start_time, end_time) tuples
 all_points = []  # (lat, lon, speed_in_knots) - used only for map bounds
 all_years = set()
 observed_max_speed = 0.0
+all_drone_points = []  # (datetime, lat, lon) points from all SRT files
+
+# Collect drone SRT tracks once so we can filter for overlap with boat timings.
+if SRT_BASE_DIR.exists():
+    for srt_file in sorted(SRT_BASE_DIR.glob("*.SRT"), key=lambda p: p.name):
+        all_drone_points.extend(parse_srt_file(srt_file))
 
 # Collect TCX files from year subdirectories
 if TCX_BASE_DIR.exists():
@@ -245,21 +319,13 @@ if TCX_BASE_DIR.exists():
             int(year)
             all_years.add(year)
             for file in sorted(year_dir.glob("*.tcx")):
-                points, removed_count, max_speed = parse_tcx_file(file)
+                points, removed_count, max_speed, route_timestamps = parse_tcx_file(file)
                 observed_max_speed = max(observed_max_speed, max_speed)
                 if points:
-                    activity_name = file.stem
-                    activity_timestamp = file.stem if not file.stem.startswith("activity_") else file.stem
-                    try:
-                        tree = ET.parse(file)
-                        ns = {"ns": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"}
-                        activity_id = tree.findtext(".//ns:Activity/ns:Id", namespaces=ns) or tree.findtext(".//ns:Lap/@StartTime", namespaces=ns)
-                        if activity_id:
-                            activity_timestamp = activity_id
-                    except Exception:
-                        pass
-                    route_label = format_edt_timestamp(activity_timestamp)
-                    runs.append((year, points, route_label, activity_name, removed_count))
+                    route_name = file.stem
+                    start_time = min(route_timestamps) if route_timestamps else None
+                    end_time = max(route_timestamps) if route_timestamps else None
+                    runs.append((year, points, route_name, removed_count, start_time, end_time))
                     all_points.extend(points)
         except ValueError:
             # Skip non-numeric directory names
@@ -341,16 +407,38 @@ if runs:
     # of point data in the file (previously it was duplicated: once inside the
     # per-segment Folium objects, and again here for the animation).
     route_data_by_year = {}
-    for year, run, route_label, activity_name, removed_count in runs:
+    for year, run, route_name, removed_count, start_time, end_time in runs:
         if year not in route_data_by_year:
             route_data_by_year[year] = []
+        route_start_utc = normalize_datetime(start_time) if start_time else None
+        route_end_utc = normalize_datetime(end_time) if end_time else None
         route_data_by_year[year].append({
-            "name": route_label,
-            "activityName": activity_name,
-            "activityTimestamp": route_label,
+            "name": route_name,
             "points": [_round_point(p) for p in run],
             "removedPoints": removed_count,
+            "startTime": route_start_utc.isoformat() if route_start_utc else None,
+            "endTime": route_end_utc.isoformat() if route_end_utc else None,
+            "dronePoints": [],
         })
+
+    # Only show drone points when their timestamps overlap the currently selected
+    # boat route. This keeps the blue overlay aligned to actual footage time windows,
+    # not just a visual line drawn across the entire session.
+    for year, routes in route_data_by_year.items():
+        for route in routes:
+            route_start = datetime.fromisoformat(route["startTime"]) if route["startTime"] else None
+            route_end = datetime.fromisoformat(route["endTime"]) if route["endTime"] else None
+            if route_start is None or route_end is None:
+                continue
+            drone_points = []
+            for drone_ts, drone_lat, drone_lon in all_drone_points:
+                if route_start <= drone_ts <= route_end:
+                    drone_points.append([round(drone_lat, COORD_PRECISION), round(drone_lon, COORD_PRECISION)])
+            if drone_points:
+                route["dronePoints"] = drone_points
+                route["name"] = format_activity_name(route["name"], [route_start.replace(tzinfo=timezone.utc), route_end.replace(tzinfo=timezone.utc)], True)
+            else:
+                route["name"] = format_activity_name(route["name"], [route_start.replace(tzinfo=timezone.utc), route_end.replace(tzinfo=timezone.utc)], False)
 
     html_path = OUTPUT_FILE
     html = html_path.read_text(encoding="utf-8")
@@ -493,6 +581,17 @@ window.addEventListener('load', function() {{
                     }}).bindTooltip(route.activityName + ' • ' + route.name + ' • Year ' + year + ': ' + avgSpeed.toFixed(1) + ' kn')
                       .addTo(routeGroup);
                 }}
+
+                if (route.dronePoints && route.dronePoints.length > 1) {{
+                    L.polyline(route.dronePoints, {{
+                        renderer: sharedRenderer,
+                        color: '#1f77ff',
+                        weight: 3,
+                        opacity: 0.9,
+                        dashArray: '8 6'
+                    }}).bindTooltip(route.name + ' • Drone overlap')
+                      .addTo(routeGroup);
+                }}
                 routeGroup.addTo(yearGroup);
                 routeLayerGroups[year][route.name] = routeGroup;
             }});
@@ -510,6 +609,15 @@ window.addEventListener('load', function() {{
         fillOpacity: 0.95,
         weight: 2
     }}).addTo(map);
+
+    const droneMarker = L.circleMarker([0, 0], {{
+        radius: 7,
+        color: '#1f77ff',
+        fillColor: '#1f77ff',
+        fillOpacity: 0.95,
+        weight: 2
+    }}).addTo(map);
+    droneMarker.setStyle({{ opacity: 0, fillOpacity: 0 }});
 
     let runIndex = 0;
     let pointIndex = 0;
@@ -708,6 +816,26 @@ window.addEventListener('load', function() {{
         }}
     }}
 
+    function updateDroneMarkerForSelection() {{
+        if (!selectedYear || !selectedRouteName) {{
+            droneMarker.setStyle({{ opacity: 0, fillOpacity: 0 }});
+            return;
+        }}
+
+        const routes = routeDataByYear[selectedYear] || [];
+        const chosen = routes.find(route => route.name === selectedRouteName);
+        const dronePoints = chosen && chosen.dronePoints ? chosen.dronePoints : [];
+
+        if (!dronePoints.length) {{
+            droneMarker.setStyle({{ opacity: 0, fillOpacity: 0 }});
+            return;
+        }}
+
+        const point = dronePoints[0];
+        droneMarker.setLatLng([point[0], point[1]]);
+        droneMarker.setStyle({{ opacity: 1, fillOpacity: 0.95 }});
+    }}
+
     function updateYearButtons() {{
         const buttons = yearButtonsContainer.querySelectorAll('button');
         buttons.forEach(btn => {{
@@ -780,6 +908,7 @@ window.addEventListener('load', function() {{
         updateYearButtons();
         updateRouteButtons();
         updateLayerOpacity();
+        updateDroneMarkerForSelection();
         updateStatusLabel();
         updateStatsDisplay();
         if (currentRuns.length === 0) {{
@@ -900,6 +1029,18 @@ window.addEventListener('load', function() {{
         routePanelContent.appendChild(section);
     }});
 
+    const prevButton = document.createElement('button');
+    prevButton.type = 'button';
+    prevButton.textContent = '⏮';
+    prevButton.style.background = '#ffffff';
+    prevButton.style.border = '1px solid #d0d7de';
+    prevButton.style.borderRadius = '999px';
+    prevButton.style.padding = '6px 10px';
+    prevButton.style.cursor = 'pointer';
+    prevButton.style.fontSize = '12px';
+    prevButton.style.boxShadow = '0 2px 8px rgba(0,0,0,0.2)';
+    overlay.appendChild(prevButton);
+
     const pausePlayButton = document.createElement('button');
     pausePlayButton.type = 'button';
     pausePlayButton.textContent = 'Pause';
@@ -911,6 +1052,101 @@ window.addEventListener('load', function() {{
     pausePlayButton.style.fontSize = '12px';
     pausePlayButton.style.boxShadow = '0 2px 8px rgba(0,0,0,0.2)';
     overlay.appendChild(pausePlayButton);
+
+    const nextButton = document.createElement('button');
+    nextButton.type = 'button';
+    nextButton.textContent = '⏭';
+    nextButton.style.background = '#ffffff';
+    nextButton.style.border = '1px solid #d0d7de';
+    nextButton.style.borderRadius = '999px';
+    nextButton.style.padding = '6px 10px';
+    nextButton.style.cursor = 'pointer';
+    nextButton.style.fontSize = '12px';
+    nextButton.style.boxShadow = '0 2px 8px rgba(0,0,0,0.2)';
+    overlay.appendChild(nextButton);
+
+    function updateAnimationAtCurrentIndex() {{
+        if (!currentRuns || currentRuns.length === 0) {{
+            return;
+        }}
+
+        while (runIndex < 0) {{
+            runIndex = currentRuns.length - 1;
+        }}
+        while (runIndex >= currentRuns.length) {{
+            runIndex = 0;
+        }}
+
+        const currentRun = currentRuns[runIndex];
+        if (!currentRun || !currentRun.length) {{
+            return;
+        }}
+
+        while (pointIndex < 0) {{
+            runIndex = (runIndex - 1 + currentRuns.length) % currentRuns.length;
+            pointIndex += currentRuns[runIndex].length;
+        }}
+
+        while (pointIndex >= currentRun.length) {{
+            pointIndex -= currentRun.length;
+            runIndex = (runIndex + 1) % currentRuns.length;
+            const nextRun = currentRuns[runIndex];
+            if (!nextRun || !nextRun.length) {{
+                pointIndex = 0;
+                break;
+            }}
+        }}
+
+        const nextRun = currentRuns[runIndex];
+        if (!nextRun || !nextRun.length) {{
+            return;
+        }}
+
+        const point = nextRun[pointIndex];
+        if (!point) {{
+            return;
+        }}
+
+        marker.setLatLng([point[0], point[1]]);
+
+        if (selectedYear && selectedRouteName) {{
+            const routes = routeDataByYear[selectedYear] || [];
+            const chosen = routes.find(route => route.name === selectedRouteName);
+            const dronePoints = chosen && chosen.dronePoints ? chosen.dronePoints : [];
+            if (dronePoints.length && nextRun.length > 1) {{
+                const progress = pointIndex / (nextRun.length - 1);
+                const droneIndex = Math.round(progress * (dronePoints.length - 1));
+                const dronePoint = dronePoints[droneIndex];
+                droneMarker.setLatLng([dronePoint[0], dronePoint[1]]);
+                droneMarker.setStyle({{ opacity: 1, fillOpacity: 0.95 }});
+            }} else {{
+                droneMarker.setStyle({{ opacity: 0, fillOpacity: 0 }});
+            }}
+        }} else {{
+            droneMarker.setStyle({{ opacity: 0, fillOpacity: 0 }});
+        }}
+
+        updateStatusLabel();
+    }}
+
+    function moveByStep(delta) {{
+        if (!currentRuns || currentRuns.length === 0) {{
+            return;
+        }}
+
+        pointIndex += delta;
+        while (pointIndex < 0) {{
+            runIndex = (runIndex - 1 + currentRuns.length) % currentRuns.length;
+            pointIndex += currentRuns[runIndex].length;
+        }}
+
+        while (pointIndex >= (currentRuns[runIndex] || []).length) {{
+            pointIndex -= (currentRuns[runIndex] || []).length;
+            runIndex = (runIndex + 1) % currentRuns.length;
+        }}
+
+        updateAnimationAtCurrentIndex();
+    }}
 
     function scheduleNext() {{
         if (paused) {{
@@ -927,6 +1163,7 @@ window.addEventListener('load', function() {{
         if (!currentRuns || currentRuns.length === 0) {{
             runIndex = 0;
             pointIndex = 0;
+            droneMarker.setStyle({{ opacity: 0, fillOpacity: 0 }});
             return;
         }}
 
@@ -940,6 +1177,23 @@ window.addEventListener('load', function() {{
         const point = currentRun[pointIndex];
         marker.setLatLng([point[0], point[1]]);
 
+        if (selectedYear && selectedRouteName) {{
+            const routes = routeDataByYear[selectedYear] || [];
+            const chosen = routes.find(route => route.name === selectedRouteName);
+            const dronePoints = chosen && chosen.dronePoints ? chosen.dronePoints : [];
+            if (dronePoints.length && currentRun.length > 1) {{
+                const progress = pointIndex / (currentRun.length - 1);
+                const droneIndex = Math.round(progress * (dronePoints.length - 1));
+                const dronePoint = dronePoints[droneIndex];
+                droneMarker.setLatLng([dronePoint[0], dronePoint[1]]);
+                droneMarker.setStyle({{ opacity: 1, fillOpacity: 0.95 }});
+            }} else {{
+                droneMarker.setStyle({{ opacity: 0, fillOpacity: 0 }});
+            }}
+        }} else {{
+            droneMarker.setStyle({{ opacity: 0, fillOpacity: 0 }});
+        }}
+
         updateStatusLabel();
 
         pointIndex += 1;
@@ -950,6 +1204,18 @@ window.addEventListener('load', function() {{
 
         scheduleNext();
     }}
+
+    prevButton.addEventListener('click', function() {{
+        paused = true;
+        pausePlayButton.textContent = 'Play';
+        moveByStep(-1);
+    }});
+
+    nextButton.addEventListener('click', function() {{
+        paused = true;
+        pausePlayButton.textContent = 'Play';
+        moveByStep(1);
+    }});
 
     pausePlayButton.addEventListener('click', function() {{
         paused = !paused;
@@ -962,6 +1228,7 @@ window.addEventListener('load', function() {{
     setRoutePanelCollapsed(false);
     updateRouteButtons();
     updateLayerOpacity();
+    updateDroneMarkerForSelection();
     setCurrentRunsForSelection();
     updateStatusLabel();
     updateStatsDisplay();
