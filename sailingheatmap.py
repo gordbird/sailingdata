@@ -168,9 +168,11 @@ def simplify_track(points, tolerance_m, speed_tolerance_kn=0.0):
 
 LOCAL_TZ = ZoneInfo("America/New_York")
 # DJI SRT captions appear to be stamped ~3 hours early relative to the sailing route clock.
-# Apply the same offset before overlap checks so the drone footage lines up with the selected
-# route windows such as 2026-07-29 15:28 EDT and 2026-07-30 15:27 EDT.
+# The remaining drift is small enough to be handled as a tolerance window rather than a
+# hard-coded extra minute offset, so 2026-07-29 15:28 EDT and 2026-07-30 15:27 EDT match
+# the drone footage without pushing it out a few minutes on the wrong side of the route.
 DRONE_TIME_OFFSET = timedelta(hours=3)
+DRONE_MATCH_TOLERANCE = timedelta(minutes=15)
 
 
 def normalize_datetime(dt):
@@ -432,7 +434,7 @@ if runs:
                 continue
             drone_points = []
             for drone_ts, drone_lat, drone_lon in all_drone_points:
-                if route_start <= drone_ts <= route_end:
+                if route_start - DRONE_MATCH_TOLERANCE <= drone_ts <= route_end + DRONE_MATCH_TOLERANCE:
                     drone_points.append([round(drone_lat, COORD_PRECISION), round(drone_lon, COORD_PRECISION)])
             if drone_points:
                 route["dronePoints"] = drone_points

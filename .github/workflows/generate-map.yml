@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'tcx/**'
+      - 'srt/**'
       - 'sailingheatmap.py'
       - 'requirements.txt'
   schedule:
@@ -48,10 +49,15 @@ jobs:
       - name: Verify output file was created
         run: ls -lh sailing_tracks_speed_arrows.html
 
+      - name: Prepare Pages site
+        run: |
+          mkdir -p _site
+          cp sailing_tracks_speed_arrows.html _site/index.html
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: .
+          path: _site
 
   deploy:
     needs: build
